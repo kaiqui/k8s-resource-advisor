@@ -1,0 +1,706 @@
+# k8s-resource-advisor
+
+Geração automática de recomendações de **Resources** e **HPA** para deployments Kubernetes a partir de dados reais de produção — sem configuração manual de apps, sem suposições e sem load tests como pré-requisito.
+
+O projeto descobre automaticamente todos os repositórios de uma organização GitHub que possuem `manifests/kubernetes/main/deploy.yaml`, extrai o service name do Datadog diretamente do manifesto, coleta métricas históricas das últimas 2 a 4 semanas e calcula os valores corretos de CPU request/limit, memory request/limit, minReplicas, maxReplicas e CPU/memory targets do HPA — levando em conta o framework Python, versão do runtime, presença de bibliotecas pesadas, comportamento de GC e startup time de cada aplicação.
+
+---
+
+## Índice
+
+1. [Por que dados históricos de produção são suficientes](#1-por-que-dados-históricos-de-produção-são-suficientes)
+2. [O papel dos load tests](#2-o-papel-dos-load-tests)
+3. [Como o cálculo de Resources funciona](#3-como-o-cálculo-de-resources-funciona)
+4. [Como o cálculo de HPA funciona](#4-como-o-cálculo-de-hpa-funciona)
+5. [Detecção automática de contexto via GitHub](#5-detecção-automática-de-contexto-via-github)
+6. [Estrutura do projeto](#6-estrutura-do-projeto)
+7. [Instalação e configuração](#7-instalação-e-configuração)
+8. [Uso](#8-uso)
+9. [Saídas geradas](#9-saídas-geradas)
+10. [Ajustes e overrides](#10-ajustes-e-overrides)
+11. [Limitações e próximos passos](#11-limitações-e-próximos-passos)
+
+---
+
+## 1. Por que dados históricos de produção são suficientes
+
+A premissa central do projeto é que **produção já é o melhor load test que existe**.
+
+Um load test sintético com k6, Locust ou qualquer outra ferramenta consegue aproximar o comportamento de uma aplicação — mas aproximação é a palavra certa. O tráfego real carrega padrões que nenhum script reproduz fielmente: a distribuição exata de endpoints chamados, o tamanho real dos payloads, o comportamento do banco de dados com dados reais, o aquecimento de caches, a variação diária e semanal de carga, os spikes causados por eventos de negócio e a interação entre múltiplos serviços chamados em conjunto.
+
+Quando uma aplicação está em produção há semanas ou meses servindo milhões de requisições, o Datadog possui um retrato completo e honesto de como ela se comporta sob carga. Esse retrato tem propriedades que nenhum load test isolado tem.
+
+**Representatividade real.** O tráfego que chegou nos últimos 28 dias é exatamente o tráfego que chegará nos próximos 28 dias, com variações sazonais que um teste de 30 minutos jamais captura. O pico de segunda-feira de manhã, o aumento de final de mês, o comportamento diferente nos fins de semana — tudo isso está nas métricas históricas.
+
+**Cobertura de todos os code paths.** Um load test cobre os endpoints que o time decidiu incluir no script. Produção cobre todos os endpoints, com os pesos reais de uso. Um endpoint raro mas computacionalmente caro que aparece 3% das vezes muda completamente o perfil de CPU de uma aplicação — e só aparece nos dados reais.
+
+**Estado real de dependências.** CPU e memória em produção refletem a latência real do banco de dados, o tamanho real das respostas de APIs externas e o comportamento real do pool de conexões. Em um ambiente de load test, o banco normalmente está vazio ou populado com dados sintéticos, o que altera dramaticamente o comportamento de I/O e consequentemente o uso de memória e CPU.
+
+**4 semanas cobrem variações cíclicas.** A janela de coleta padrão do projeto é de 28 dias, o que captura pelo menos 4 ciclos semanais completos. Isso é suficiente para identificar o P99 de CPU e memória que representa o pior cenário recorrente — e é esse P99 que determina os limits.
+
+### O que dados históricos não conseguem cobrir
+
+Dois cenários genuinamente escapam da análise histórica.
+
+**Tráfego substancialmente acima do histórico.** Se o negócio espera crescimento de 5x em 6 meses ou um evento pontual de alto tráfego como Black Friday ou lançamento de campanha, o `peak_traffic_multiplier` configurável existe exatamente para projetar esse cenário. O padrão é 3x — o sistema é dimensionado para suportar 3 vezes o pico histórico antes de precisar de intervenção manual.
+
+**Apps novas sem histórico.** Para uma aplicação que acabou de entrar em produção, não há dados suficientes. O `data_quality_score` gerado pelo profiler será baixo e o relatório sinalizará isso explicitamente. Um load test é a ferramenta correta para esse caso específico.
+
+---
+
+## 2. O papel dos load tests
+
+O projeto não elimina load tests — ele os reposiciona.
+
+**Dados históricos definem a baseline.** Os valores de CPU request, memory limit e HPA calculados por este projeto são baseados no comportamento real da aplicação em produção. Eles são o ponto de partida correto e confiável.
+
+**Load tests validam e descobrem limites absolutos.** Um load test com k6 ou Locust serve para responder perguntas que dados históricos não conseguem:
+
+- *Qual é o limite absoluto de RPS que essa aplicação suporta antes de degradar?* Dados históricos mostram o que aconteceu, não o teto teórico.
+- *O que acontece se o tráfego dobrar em 60 segundos?* Simula spikes abruptos que podem não ter ocorrido no histórico.
+- *Qual é o comportamento sob degradação?* Quando um pod satura, ele responde mais devagar ou começa a retornar erros? Dados históricos raramente capturam o momento exato da saturação.
+- *As readiness probes estão configuradas corretamente?* Um load test que inclui restarts de pod valida o comportamento durante scale-up de forma controlada.
+
+**O fluxo recomendado é sequencial, não alternativo:**
+
+```
+1. k8s-resource-advisor  → baseline a partir de dados reais de produção
+2. Aplica em staging com os valores gerados
+3. Load test em staging  → valida limites e comportamento de borda
+4. Ajusta se necessário  → aplica em produção
+5. Monitora 1-2 semanas → roda k8s-resource-advisor novamente para refinamento
+```
+
+Usar load test sem baseline histórica significa gastar tempo descobrindo o que produção já sabe. Usar baseline histórica sem load test significa confiar que o histórico cobre todos os cenários de borda — o que é seguro para apps maduras e estáveis, mas imprudente para apps novas ou que passarão por mudanças significativas de tráfego.
+
+---
+
+## 3. Como o cálculo de Resources funciona
+
+### 3.1 Coleta de métricas
+
+O Datadog coleta por pod, por janela de 5 minutos, durante as semanas configuradas:
+
+| Métrica | Query Datadog | Uso no cálculo |
+|---|---|---|
+| CPU usage | `kubernetes.cpu.usage.total` (ns) ÷ 1e9 | Série temporal de cores por pod |
+| CPU throttle | `kubernetes.cpu.throttled.time` ÷ `kubernetes.cpu.usage.total` | Detecta limit subestimado |
+| Memória | `kubernetes.memory.working_set` | Working set real (exclui page cache) |
+| OOMKills | `kubernetes.containers.restarts` filtrado por `reason:oomkilled` | Detecta limit insuficiente |
+| RPS | `trace.web.request.hits` (APM) ou `nginx.net.request_per_s` | Normalização por réplica |
+| Réplicas | `kubernetes.deployments.replicas_available` | Base para min/max HPA |
+
+As séries temporais são médias entre todos os pods do deployment — o objetivo é entender o comportamento típico de um pod individual, não o consumo total do cluster.
+
+### 3.2 Classificação de perfil
+
+Antes de calcular os valores, o profiler classifica cada aplicação em um de quatro perfis:
+
+**CPU-bound** — CPU sobe proporcionalmente ao RPS e o P99 de utilização do limit supera 60%, ou há throttling acima de 10%. Típico de aplicações com processamento intenso: compressão, serialização, regex complexo, cálculos matemáticos.
+
+**I/O-bound** — CPU permanece baixa mesmo sob alto RPS porque o pod passa a maior parte do tempo aguardando respostas externas. Característico de frameworks async como FastAPI e aiohttp com alto grau de paralelismo de coroutines.
+
+**Memory-bound** — Memória cresce sem correlação direta com RPS e CPU permanece estável. Ocorre em aplicações com caching agressivo em memória, processamento de payloads grandes ou uso intenso de pandas/numpy.
+
+**Mixed** — Comportamento híbrido que não se enquadra nas categorias acima.
+
+Esse perfil influencia os fatores de burst e headroom aplicados nos cálculos seguintes.
+
+### 3.3 CPU request
+
+O CPU request representa o que o pod precisa em condições normais de operação. A base é o **P75 da série temporal de CPU** — o valor que o pod usa ou abaixo do qual fica 75% do tempo.
+
+A escolha do P75 é deliberada. O P50 seria otimista demais (metade do tempo o pod usa mais do que isso). O P95 seria conservador demais para o request — esse percentil é reservado para situações de throttling detectado. O P75 representa a carga normal com margem para variações intradiárias sem reservar recursos que ficam ociosos.
+
+Sobre o P75 é aplicado um headroom de 20%:
+
+```
+cpu_request = P75(cpu_usage) × 1.20
+```
+
+**Exceção para throttling detectado.** Se o P95 de CPU throttle supera 15%, significa que o limit atual está ativamente sufocando a aplicação — o scheduler Linux está limitando ciclos de CPU. Nesse caso, o P75 histórico está distorcido para baixo (o pod nunca pôde usar mais do que o limit permitia), então a base sobe para P95:
+
+```
+# Quando throttle P95 > 15%
+cpu_request = P95(cpu_usage) × 1.20
+```
+
+O mínimo absoluto é 50m — abaixo disso o scheduler do Kubernetes toma decisões ruins de placement e QoS.
+
+### 3.4 CPU limit
+
+O CPU limit define o teto de burst. A diferença fundamental entre request e limit é que o request determina onde o pod é alocado (scheduling), enquanto o limit determina até onde o pod pode ir antes de ser throttled pelo kernel.
+
+O fator de burst varia pelo tipo de framework:
+
+**WSGI (Flask+Gunicorn, Django+uWSGI)** — cada worker é um processo bloqueante que pode puxar 100% de um core durante o processamento de uma requisição. O pico de CPU pode ser significativamente maior que a média, especialmente durante rajadas de tráfego onde todos os workers estão ocupados simultaneamente. Fator de burst: **2.0×**.
+
+**Async (FastAPI, aiohttp)** — a CPU é distribuída entre coroutines e o comportamento é mais previsível. O event loop nivela o uso e o pico tende a ser menos extremo. Fator de burst: **1.5×**.
+
+```
+# WSGI
+cpu_limit = cpu_request × 2.0
+
+# Async
+cpu_limit = cpu_request × 1.5
+```
+
+Se o **knee point** estimado — o ponto onde o pod começa a saturar, calculado a partir do P99 histórico multiplicado pelo fator de pico — é maior que o limit calculado pela fórmula, o limit é ajustado para o knee point. Isso garante que o pod nunca seja throttled antes de atingir sua capacidade natural.
+
+### 3.5 Memory request
+
+O memory request usa o **P75 da série temporal de memória working set**, com headroom de 30%:
+
+```
+mem_request = P75(memory_working_set) × 1.30
+```
+
+O headroom de memória é maior que o de CPU por duas razões: o GC do Python não devolve memória ao sistema operacional imediatamente após liberar objetos (especialmente com objetos de vida longa), e picos de memória tendem a ser menos suaves que picos de CPU — uma requisição que desserializa um payload grande pode alocar o dobro da memória usual de forma momentânea.
+
+**Fator adicional para bibliotecas pesadas.** Quando pandas, numpy ou scipy são detectados nas dependências, um fator multiplicador de 1.20 é aplicado:
+
+```
+mem_request = P75(memory_working_set) × 1.30 × 1.20
+```
+
+Essas bibliotecas alocam arrays e dataframes em C-extensions fora do heap padrão do Python, e o comportamento de memória é mais volátil e difícil de prever pela série temporal sozinha.
+
+O mínimo absoluto é 64Mi.
+
+### 3.6 Memory limit
+
+O memory limit é calculado sobre o request com headroom adicional:
+
+```
+# Python 3.x
+mem_limit = mem_request × 1.50
+
+# Python 2.7 — GC menos eficiente, fragmentação maior
+mem_limit = mem_request × 1.70
+```
+
+Python 2.7 usa um alocador de memória diferente e o GC de gerações tem comportamento menos previsível, especialmente em aplicações de longa duração. O headroom adicional existe para absorver picos de fragmentação sem causar OOMKill.
+
+**Ajuste para memory leak detectado.** O profiler executa uma regressão linear sobre a série temporal de memória. Se a inclinação representa crescimento acima de 5% por semana, o sistema troca a base do cálculo de P75 para P99:
+
+```
+# Quando memory leak detectado
+mem_limit = P99(memory_working_set) × headroom
+```
+
+Isso dá mais espaço para a aplicação funcionar até que o leak seja investigado e corrigido, sem remover a proteção contra OOM.
+
+**Ajuste para OOMKills históricos.** Se a aplicação teve ao menos um OOMKill no período analisado, o limit calculado recebe um acréscimo de 30% independentemente dos outros fatores:
+
+```
+# Quando oom_kill_count > 0
+mem_limit = mem_limit_calculado × 1.30
+```
+
+OOMKills são eventos graves — o pod é morto sem graceful shutdown e todas as requisições em andamento são perdidas. A penalidade de 30% é propositalmente conservadora para eliminar qualquer risco de recorrência enquanto a causa raiz é investigada.
+
+O mínimo absoluto é 128Mi.
+
+---
+
+## 4. Como o cálculo de HPA funciona
+
+### 4.1 minReplicas
+
+O `minReplicas` garante disponibilidade mínima mesmo sem nenhum tráfego. O valor é calculado em duas partes.
+
+**Base histórica.** O P10 da série de réplicas ativas é usado como piso — representa o menor número de réplicas que o cluster considerou necessário durante o período de 4 semanas, excluindo os momentos de carga mais baixa. O mínimo absoluto é 2 (nunca single point of failure).
+
+**Startup bump.** O tempo de startup tem impacto direto no risco de um scale-up demorado. Se o pod demora para ficar pronto, o HPA precisa antecipar o scale-up — e a melhor forma de antecipar é manter mais réplicas no mínimo para que o scale-up seja necessário com menos frequência.
+
+| Startup P95 | Ajuste | Justificativa |
+|---|---|---|
+| < 30s | Nenhum | Scale-up reage rápido o suficiente |
+| 30s – 60s | +1 réplica | Margem extra para absorver spikes enquanto pods sobem |
+| > 60s | +2 réplicas | Startup lento exige buffer maior |
+
+```
+min_replicas = max(2, P10(replicas_historicas) + startup_bump)
+```
+
+### 4.2 maxReplicas
+
+O `maxReplicas` é o teto de scale-out — quantas réplicas são necessárias para absorver o pico projetado.
+
+**Quando há dados de RPS (APM instrumentado):**
+
+O sistema calcula o RPS por pod no P95 histórico e projeta quantas réplicas seriam necessárias se o tráfego fosse `peak_traffic_multiplier` vezes maior:
+
+```
+rps_total_pico = RPS_por_pod_P95 × avg_replicas × peak_traffic_multiplier
+max_replicas   = ceil(rps_total_pico / RPS_por_pod_P95)
+               = ceil(avg_replicas × peak_traffic_multiplier)
+```
+
+**Quando não há dados de RPS:**
+
+Usa o pico histórico de réplicas multiplicado pelo fator de pico:
+
+```
+max_replicas = ceil(peak_replicas_historicas × peak_traffic_multiplier)
+```
+
+O `peak_traffic_multiplier` padrão é 3.0 — o sistema é dimensionado para suportar 3 vezes o pico já observado. Esse valor pode ser sobrescrito por aplicação nos overrides do settings, especialmente para serviços com crescimento acelerado ou eventos previstos.
+
+### 4.3 CPU target do HPA
+
+O target de CPU do HPA define em qual percentual de utilização o escalonador deve adicionar réplicas. É o parâmetro mais crítico do HPA e o mais frequentemente mal configurado.
+
+Um target muito alto (90%) significa que o HPA escala tarde demais — quando 90% do limit já está sendo consumido, novos pods levam segundos ou dezenas de segundos para ficarem prontos, e durante esse tempo os pods existentes já estão sofrendo throttling e os usuários já sentem a latência aumentar.
+
+Um target muito baixo (20%) significa que o HPA escala cedo demais — o cluster mantém muitas réplicas ociosas, o custo de infraestrutura sobe desnecessariamente e o scale-down frequente causa flapping.
+
+O cálculo parte do **knee point** — o ponto de CPU onde a aplicação começa a saturar, estimado a partir do P99 histórico multiplicado pelo fator de pico. O target é definido como uma fração desse ponto relativo ao limit:
+
+```
+cpu_target = (knee_point / cpu_limit) × safety_margin × 100
+```
+
+O `safety_margin` padrão é 0.70 — o HPA escala quando a CPU está em 70% do caminho até o ponto de saturação. O resultado é clampado entre 40% e 80% para evitar extremos:
+
+- Abaixo de 40% o HPA nunca consegue estabilizar — adiciona réplicas constantemente mesmo sem pressão real.
+- Acima de 80% o tempo de reação é insuficiente para apps com startup lento, pois os pods sobem depois que o dano já foi feito.
+
+**Exemplo concreto.** Uma aplicação Flask+Gunicorn com knee point estimado em 600m e cpu_limit de 1000m:
+
+```
+raw_target = (0.600 / 1.000) × 0.70 = 42%
+cpu_target = 42%  ← dentro do range [40%, 80%], sem clamp
+```
+
+O HPA vai escalar quando a CPU média dos pods atingir 42% do limit (420m), deixando quase 60% de margem para que os novos pods fiquem prontos antes da saturação real.
+
+### 4.4 Memory target do HPA
+
+Memória é tratada de forma diferente de CPU no Kubernetes: não existe throttling de memória — quando o pod ultrapassa o limit é OOMKilled imediatamente, sem aviso. Por isso, o target de memória é conservador por design: **75% do limit**.
+
+Se memory leak é detectado, o target cai para **65%**, dando mais espaço de reação antes que o GC seja forçado a coletar ou o pod seja eliminado.
+
+O HPA de memória serve principalmente como gatilho de segurança. Em aplicações saudáveis, o CPU target escala primeiro. O memory target protege contra crescimento anômalo de memória que não se reflete no CPU — sessões em memória, caches que crescem sem bound, ou leaks graduais.
+
+### 4.5 Behavior — velocidade de scale-up e scale-down
+
+O campo `behavior` do HPA v2 controla a velocidade de reação em ambas as direções e é gerado automaticamente com base no perfil da aplicação.
+
+**Scale-up deve ser rápido.** Quando os pods estão sob pressão, cada segundo conta. A política de scale-up adiciona pods em volume suficiente para compensar o tempo de startup:
+
+| Startup P95 | Política de scale-up | Janela de estabilização |
+|---|---|---|
+| < 30s | +2 pods a cada 30s | 30s |
+| 30s – 60s | +4 pods a cada 30s | 15s |
+| > 60s | +20% dos pods a cada 60s | 0s (reage imediatamente) |
+
+Quando o startup ultrapassa 60s, a janela de estabilização do scale-up é zerada — o HPA reage imediatamente sem aguardar confirmação de que a métrica se manteve alta, porque o custo de esperar é maior que o custo de escalar desnecessariamente.
+
+**Scale-down deve ser lento.** Remover réplicas cedo demais é a principal causa de flapping — o cluster escala para baixo, a carga sobe levemente, o HPA precisa escalar para cima novamente em minutos. Pods são terminados com requisições em andamento, novos pods precisam ser iniciados, e o cluster oscila.
+
+A política de scale-down remove apenas 10% das réplicas por ciclo de 60 segundos, com janela de estabilização de 5 minutos:
+
+```yaml
+scaleDown:
+  stabilizationWindowSeconds: 300
+  policies:
+  - type: Percent
+    value: 10
+    periodSeconds: 60
+```
+
+Para WSGI, a janela mínima é sempre 5 minutos — workers bloqueantes mantêm conexões HTTP que podem durar dezenas de segundos, e terminar um pod WSGI no meio de uma requisição causa erro direto para o usuário. Para async, a janela pode ser configurada para menos.
+
+---
+
+## 5. Detecção automática de contexto via GitHub
+
+Nenhuma configuração de app é necessária no `settings.yaml`. O pipeline descobre automaticamente o parque de aplicações a partir da organização GitHub.
+
+### 5.1 Descoberta de repositórios
+
+O collector lista todos os repositórios da organização com paginação (100 repos por request), filtrando por padrão repos arquivados e forks. Para cada repo, verifica se `manifests/kubernetes/main/deploy.yaml` existe — se não existir, o repo é ignorado silenciosamente. Apenas repositórios com deploy.yaml são tratados como aplicações Kubernetes gerenciadas.
+
+O rate limit da API do GitHub autenticada é de 5.000 requests/hora. Uma org com 100 repositórios consome aproximadamente 400 requests no total (1 para listagem + ~4 por repo), deixando ampla margem para execuções frequentes.
+
+### 5.2 Extração do DD_SERVICE
+
+O service name do Datadog é extraído do deploy.yaml em ordem de prioridade:
+
+1. Variável de ambiente `DD_SERVICE` no container (valor direto ou via `valueFrom.fieldRef`)
+2. Label `tags.datadoghq.com/service` no pod template (Datadog Unified Service Tagging)
+3. Label genérica `service:` ou `app:` no pod template
+4. Nome do Deployment (último recurso, gera warning — valide se bate com o Datadog)
+
+### 5.3 O que é extraído de cada arquivo
+
+**`manifests/kubernetes/main/deploy.yaml`** (obrigatório para descoberta):
+- `DD_SERVICE`, `DD_ENV` — identificação no Datadog
+- `namespace` — namespace Kubernetes
+- `resources.requests/limits` — configuração atual (fonte de verdade mais confiável que o Datadog histórico)
+- HPA: `minReplicas`, `maxReplicas`, targets (suporta v1 e v2)
+
+**`Dockerfile`** (raiz do repositório):
+- `FROM python:X.Y` — versão do Python
+- `CMD` / `ENTRYPOINT` — comando de startup, número de workers Gunicorn/Uvicorn, porta
+
+**`pyproject.toml`** ou **`requirements.txt`** (tentados nessa ordem, depois `requirements/*.txt`):
+- Framework: FastAPI, Flask, Django, aiohttp, Tornado, Starlette
+- Bibliotecas pesadas: pandas, numpy, scipy
+- `requires-python` — confirmação de versão do runtime
+
+---
+
+## 6. Estrutura do projeto
+
+```
+k8s-resource-advisor/
+│
+├── main.py                     # CLI: run | list | generate
+│
+├── collectors/
+│   ├── github.py               # Descoberta de repos e extração de contexto
+│   └── datadog.py              # Coleta de métricas históricas via API v1
+│
+├── analyzers/
+│   └── profiler.py             # Classificação de perfil, percentis, detecção de problemas
+│
+├── calculators/
+│   ├── resources.py            # CPU e memory request/limit
+│   └── hpa.py                  # minReplicas, maxReplicas, targets, behavior
+│
+├── reporters/
+│   ├── yaml_gen.py             # Manifests YAML comentados prontos para aplicar
+│   └── report.py               # Relatório HTML comparativo
+│
+├── config/
+│   └── settings.example.yaml   # Configuração mínima (sem bloco apps:)
+│
+├── tools/
+│   └── mock_data.py            # Dados sintéticos para testes sem credenciais
+│
+└── pyproject.toml
+```
+
+### Fluxo de dados
+
+```
+GitHub API
+  discover_apps(org)
+    │  Para cada repo com deploy.yaml:
+    │    deploy.yaml   → DD_SERVICE, namespace, resources atuais, HPA atual
+    │    Dockerfile    → python_version, workers
+    │    requirements  → framework, pandas/numpy
+    ▼
+  github_info_to_app_config()   ← zero configuração manual
+    │
+    ▼
+Datadog API
+  DatadogCollector.collect()    ← usa dd_service extraído do deploy.yaml
+    │  CPU, memória, RPS, OOMKills, throttle — últimas N semanas
+    ▼
+AppProfiler.analyze()           ← percentis, perfil, warnings, detecção de leak
+    │
+    ├──▶ ResourceCalculator     → cpu/mem request + limit com headrooms e ajustes
+    └──▶ HPACalculator          → min/max replicas, targets, behavior por framework
+              │
+              ├──▶ output/manifests/{app}-resources-patch.yaml
+              ├──▶ output/manifests/{app}-hpa.yaml
+              └──▶ output/report.html
+```
+
+---
+
+## 7. Instalação e configuração
+
+### Pré-requisitos
+
+- Python 3.10+
+- Poetry
+- GitHub Personal Access Token com permissão de leitura nos repositórios da organização (`repo:read` ou `contents:read`)
+- Datadog API Key + Application Key com permissão de leitura de métricas
+
+### Instalação
+
+```bash
+git clone https://github.com/sua-org/k8s-resource-advisor
+cd k8s-resource-advisor
+poetry install
+```
+
+### Configuração
+
+```bash
+cp config/settings.example.yaml config/settings.yaml
+```
+
+Edite `config/settings.yaml`:
+
+```yaml
+github:
+  token: "${GITHUB_TOKEN}"
+  org: "sua-organizacao"
+  # base_url: "https://github.empresa.com/api/v3"  # GitHub Enterprise
+
+datadog:
+  api_key: "${DD_API_KEY}"
+  app_key: "${DD_APP_KEY}"
+  site: "datadoghq.com"    # datadoghq.eu para região EU
+  env: "production"
+
+collection:
+  weeks: 4
+  cache_dir: "./output/data"
+
+# Todos os thresholds abaixo são os defaults — altere só se necessário
+thresholds:
+  cpu_request_headroom: 1.20
+  cpu_limit_headroom_wsgi: 2.0
+  cpu_limit_headroom_async: 1.5
+  mem_request_headroom: 1.30
+  mem_limit_headroom: 1.50
+  mem_limit_headroom_legacy: 1.70
+  mem_extra_heavy_libs: 1.20
+  hpa_cpu_safety_margin: 0.70
+  hpa_mem_target: 75
+  hpa_scaleup_window_seconds: 30
+  hpa_scaledown_window_seconds: 300
+```
+
+Configure as variáveis de ambiente ou use um arquivo `.env` na raiz:
+
+```bash
+GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+DD_API_KEY=xxxxxxxxxxxxxxxx
+DD_APP_KEY=xxxxxxxxxxxxxxxx
+```
+
+---
+
+## 8. Uso
+
+### Pipeline completo — descobre e analisa toda a organização
+
+```bash
+poetry run advisor run --weeks 4
+```
+
+Descobre automaticamente todos os repos da org, coleta métricas do Datadog, calcula as recomendações e gera manifests e relatório HTML.
+
+### Filtrar por subconjunto de repositórios
+
+```bash
+# Apenas repos cujo nome contém "api"
+poetry run advisor run --filter api --weeks 4
+
+# Um repositório específico
+poetry run advisor run --repo minha-api --weeks 2
+
+# Repo de outra org
+poetry run advisor run --repo outra-org/minha-api
+```
+
+### Listar apps descobertas sem coletar métricas
+
+Útil para validar que o DD_SERVICE está sendo extraído corretamente antes de rodar a coleta:
+
+```bash
+poetry run advisor list
+```
+
+```
+Service (DD_SERVICE)       Namespace    Python  Framework  CPU atual      Mem atual         HPA min/max
+api-gateway                production   3.11    fastapi    200m/500m      256Mi/512Mi       2/10
+legacy-auth                production   2.7     wsgi       500m/1000m     512Mi/1Gi         2/8
+data-processor             production   3.9     flask      750m/1500m     1Gi/2Gi           2/10
+```
+
+### Regenerar YAMLs do cache
+
+Após a primeira coleta, regenera manifests sem re-consultar Datadog ou GitHub. Útil ao ajustar thresholds:
+
+```bash
+poetry run advisor generate
+
+# Apenas uma app
+poetry run advisor generate --filter billing-api
+```
+
+### Testar sem credenciais
+
+```bash
+python tools/mock_data.py
+poetry run advisor generate --output ./output
+```
+
+Gera dados sintéticos para 5 aplicações com perfis variados e executa o pipeline completo localmente.
+
+---
+
+## 9. Saídas geradas
+
+```
+output/
+├── manifests/
+│   ├── api-gateway-resources-patch.yaml
+│   ├── api-gateway-hpa.yaml
+│   └── ...
+├── report.html
+└── data/
+    ├── api-gateway-metrics.json    # cache Datadog (evita re-coleta)
+    ├── api-gateway-github.json     # cache GitHub
+    └── ...
+```
+
+### Exemplo de manifest de resources gerado
+
+```yaml
+# Fonte: GitHub minha-org/api-gateway (main)
+# Python detectado: 3.11 (Dockerfile)
+# Framework detectado: fastapi | Gerenciador: poetry
+# Resources anteriores (deploy.yaml): cpu=200m/500m mem=256Mi/512Mi
+# HPA anterior (deploy.yaml): min=2 max=10 cpu_target=70%
+#
+# Resources Patch — api-gateway
+# Framework: async | Python: 3.11
+# Perfil: io_bound | Dados: 4 semanas | Qualidade: 100%
+#
+# Racional dos valores:
+#   cpu_request: P75(0.251 cores) * headroom 1.2x
+#   cpu_limit:   Request * burst_factor 1.5x (async)
+#   mem_request: P75(198Mi) * headroom 1.3x
+#   mem_limit:   Request * 1.5x
+#
+# Variação vs configuração atual:
+#   cpu_request: +50% vs atual
+#   mem_limit:   -18% vs atual
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: production
+spec:
+  template:
+    spec:
+      containers:
+      - name: api-gateway
+        resources:
+          requests:
+            cpu: "301m"
+            memory: "258Mi"
+          limits:
+            cpu: "452m"
+            memory: "387Mi"
+```
+
+### Exemplo de HPA gerado
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-gateway
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-gateway
+  minReplicas: 2    # P10 histórico; sem startup bump (P95=8s)
+  maxReplicas: 15   # avg_replicas(5) * peak_multiplier(3.0)
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 56    # knee(0.253)/limit(0.452) * safety(0.70)
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+Para aplicar:
+
+```bash
+# Resources
+kubectl patch deployment api-gateway -n production \
+  --patch-file output/manifests/api-gateway-resources-patch.yaml
+
+# HPA
+kubectl apply -f output/manifests/api-gateway-hpa.yaml
+```
+
+---
+
+## 10. Ajustes e overrides
+
+Para sobrescrever parâmetros de uma app específica, use a seção `overrides` no `settings.yaml`, referenciando o `dd_service` como chave:
+
+```yaml
+overrides:
+  api-gateway:
+    sla_latency_p95_ms: 100        # SLA mais apertado
+    peak_traffic_multiplier: 5.0   # crescimento acelerado previsto
+
+  legacy-auth:
+    peak_traffic_multiplier: 2.0   # app estável, sem crescimento previsto
+    min_replicas_override: 4       # mínimo maior por criticidade de negócio
+
+  data-processor:
+    peak_traffic_multiplier: 2.0   # workload batch, pico controlado
+```
+
+---
+
+## 11. Limitações e próximos passos
+
+**O que o projeto não faz:**
+
+- Recomendações para **jobs e cronjobs** — o comportamento burst-and-idle é diferente de serviços long-running e requer metodologia própria.
+- Geração de **KEDA ScaledObjects** — o projeto sinaliza quando KEDA seria mais adequado (startup > 90s ou app CPU-bound sem RPS instrumentado), mas não gera os manifests.
+- Recomendações de **VPA** — em alguns casos o Vertical Pod Autoscaler é mais adequado que HPA, especialmente para workloads com tráfego baixo e previsível.
+- Integração com **cluster autoscaler** — o maxReplicas é calculado sem considerar os limites de nodes disponíveis no cluster.
+
+**Quando re-executar:**
+
+- A cada 4 a 6 semanas em regime normal de operação
+- Após mudanças significativas de tráfego (campanha, feature importante, crescimento orgânico acelerado)
+- Após otimizações de performance na aplicação que alterem o perfil de CPU ou memória
+- Após atualização de versão do framework ou do Python
+
+**Ciclo completo recomendado:**
+
+```
+k8s-resource-advisor   → baseline a partir de dados reais de produção
+       ↓
+Aplica em staging
+       ↓
+Load test (k6/Locust)  → valida limites absolutos e comportamento sob degradação
+       ↓
+Ajusta se necessário
+       ↓
+Aplica em produção
+       ↓
+Monitora 2 semanas
+       ↓
+k8s-resource-advisor   → refina com os novos dados acumulados
+```
