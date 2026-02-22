@@ -1,0 +1,60 @@
+# ─────────────────────────────────────────────────────────────────
+# k8s Resource Advisor — settings.yaml
+#
+# Não é necessário configurar cada app individualmente.
+# O pipeline descobre automaticamente todos os repositórios da
+# organização que possuem manifests/kubernetes/main/deploy.yaml
+# e extrai do próprio arquivo o service name do Datadog.
+# ─────────────────────────────────────────────────────────────────
+
+github:
+  token: "${GITHUB_TOKEN}"          # Personal Access Token (5000 req/h)
+  org: "minha-org"                  # organização ou usuário GitHub
+  # base_url: "https://github.mycompany.com/api/v3"  # GitHub Enterprise
+
+  # Filtros opcionais de descoberta
+  # repo_filter: "api"              # só repos cujo nome contém "api"
+  # skip_archived: true             # ignora repos arquivados (default: true)
+  # skip_forks: true                # ignora forks (default: true)
+  # max_repos: 500                  # limite de segurança (default: 500)
+
+datadog:
+  api_key: "${DD_API_KEY}"
+  app_key: "${DD_APP_KEY}"
+  site: "us5.datadoghq.com"            # datadoghq.com | datadoghq.eu | us3.datadoghq.com
+  env: "production"                # tag env: usada em todas as queries
+
+collection:
+  weeks: 4                         # janela de coleta em semanas
+  interval_seconds: 300            # granularidade das métricas (5min)
+  cache_dir: "./output/data"       # cache local (evita re-coleta)
+
+thresholds:
+  cpu_request_headroom: 1.20       # +20% sobre P75
+  cpu_limit_headroom_wsgi: 2.0     # burst WSGI (processo bloqueante)
+  cpu_limit_headroom_async: 1.5    # burst async (fastapi/aiohttp)
+  mem_request_headroom: 1.30       # +30% sobre P75
+  mem_limit_headroom: 1.50         # 1.5x sobre request
+  mem_limit_headroom_legacy: 1.70  # Python 2.7: GC menos eficiente
+  mem_extra_heavy_libs: 1.20       # +20% se usa pandas/numpy/scipy
+
+  hpa_cpu_safety_margin: 0.70      # escala em 70% do ponto de saturação
+  hpa_mem_target: 75
+  hpa_scaleup_window_seconds: 30
+  hpa_scaledown_window_seconds: 300
+
+# ─────────────────────────────────────────────────────────────────
+# Overrides por app (opcional)
+#
+# Se quiser ajustar parâmetros específicos de alguma app descoberta
+# automaticamente, adicione aqui usando dd_service como chave.
+# Qualquer campo não definido usa o valor descoberto do GitHub.
+# ─────────────────────────────────────────────────────────────────
+overrides:
+  # minha-api-critica:
+  #   sla_latency_p95_ms: 100        # SLA mais apertado
+  #   peak_traffic_multiplier: 5.0   # pico esperado maior
+  #   min_replicas_override: 5       # nunca abaixo de 5 réplicas
+
+  # legacy-monolito:
+  #   peak_traffic_multiplier: 2.0

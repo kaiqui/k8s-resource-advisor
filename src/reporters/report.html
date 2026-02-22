@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>k8s Resource Advisor — Relatório</title>
+<style>
+  :root {
+    --blue: #2563eb; --green: #16a34a; --red: #dc2626;
+    --yellow: #ca8a04; --gray: #6b7280; --light: #f9fafb;
+    --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #f3f4f6; color: #111827; line-height: 1.5; }
+  .container { max-width: 1280px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 1.875rem; font-weight: 700; margin-bottom: 4px; }
+  h2 { font-size: 1.25rem; font-weight: 600; margin: 24px 0 12px; }
+  h3 { font-size: 1rem; font-weight: 600; margin-bottom: 8px; color: var(--gray); }
+  .subtitle { color: var(--gray); font-size: 0.875rem; margin-bottom: 24px; }
+  .card { background: white; border-radius: 8px; border: 1px solid var(--border);
+          padding: 20px; margin-bottom: 20px; }
+  .app-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .badge { font-size: 0.75rem; padding: 2px 10px; border-radius: 9999px; font-weight: 500; }
+  .badge-blue { background: #dbeafe; color: #1e40af; }
+  .badge-green { background: #dcfce7; color: #166534; }
+  .badge-yellow { background: #fef9c3; color: #854d0e; }
+  .badge-red { background: #fee2e2; color: #991b1b; }
+  .badge-gray { background: #f3f4f6; color: #374151; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+  th { text-align: left; padding: 8px 12px; background: var(--light);
+       border-bottom: 1px solid var(--border); font-weight: 600; color: var(--gray); }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  .delta-pos { color: var(--green); font-weight: 500; }
+  .delta-neg { color: var(--red); font-weight: 500; }
+  .delta-neu { color: var(--gray); }
+  .warn-critical { border-left: 3px solid var(--red); padding: 8px 12px;
+                   background: #fff5f5; border-radius: 0 4px 4px 0; margin-bottom: 8px; }
+  .warn-warning { border-left: 3px solid var(--yellow); padding: 8px 12px;
+                  background: #fffbeb; border-radius: 0 4px 4px 0; margin-bottom: 8px; }
+  .warn-info { border-left: 3px solid var(--blue); padding: 8px 12px;
+               background: #eff6ff; border-radius: 0 4px 4px 0; margin-bottom: 8px; }
+  .warn-label { font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
+                letter-spacing: 0.05em; margin-bottom: 2px; }
+  .warn-critical .warn-label { color: var(--red); }
+  .warn-warning .warn-label { color: var(--yellow); }
+  .warn-info .warn-label { color: var(--blue); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .yaml-cmd { background: #1e293b; color: #94a3b8; padding: 12px 16px;
+              border-radius: 6px; font-family: monospace; font-size: 0.8rem; margin-top: 8px; }
+  .yaml-cmd span { color: #38bdf8; }
+  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
+  .stat-box { background: var(--light); border-radius: 6px; padding: 10px 14px; }
+  .stat-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
+                color: var(--gray); margin-bottom: 2px; }
+  .stat-value { font-size: 1.25rem; font-weight: 700; }
+  .keda-box { background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 6px;
+              padding: 12px 16px; margin-top: 12px; }
+  .keda-box h3 { color: #0369a1; margin-bottom: 4px; }
+  summary { cursor: pointer; font-weight: 600; color: var(--blue); padding: 4px 0; }
+  details { margin-top: 8px; }
+  .rationale { font-size: 0.8rem; color: var(--gray); font-family: monospace;
+               background: var(--light); padding: 8px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>k8s Resource Advisor</h1>
+  <p class="subtitle">
+    Gerado em 2026-02-21 12:59 UTC &nbsp;|&nbsp;
+    5 aplicações analisadas &nbsp;|&nbsp;
+    Janela: 2 semanas
+  </p>
+
+  
+  <div class="card">
+    <div class="app-header">
+      <h2 style="margin:0">api-gateway</h2>
+      <span class="badge badge-blue">
+        ASYNC
+      </span>
+      <span class="badge badge-gray">Python 3.11</span>
+      <span class="badge badge-red">
+        CPU BOUND
+      </span>
+      
+      
+    </div>
+
+    <!-- Stats rápidos -->
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-label">CPU P95</div>
+        <div class="stat-value">481m</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Mem P95</div>
+        <div class="stat-value">259Mi</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Réplicas avg/max</div>
+        <div class="stat-value">5.5 / 7</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Startup P95</div>
+        <div class="stat-value">8s</div>
+      </div>
+    </div>
+
+    <!-- Warnings -->
+    
+
+    <!-- Tabela comparativa -->
+    <div class="grid-2" style="margin-top:16px">
+      <div>
+        <h3>CPU & Memória — Resources</h3>
+        <table>
+          <tr>
+            <th>Parâmetro</th><th>Atual</th><th>Recomendado</th><th>Δ</th>
+          </tr>
+          <tr>
+            <td>cpu.request</td>
+            <td>210m</td>
+            <td><strong>451m</strong></td>
+            <td class="delta-pos">
+              +115%
+            </td>
+          </tr>
+          <tr>
+            <td>cpu.limit</td>
+            <td>450m</td>
+            <td><strong>1.5</strong></td>
+            <td class="delta-pos">
+              +240%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.request</td>
+            <td>144Mi</td>
+            <td><strong>281Mi</strong></td>
+            <td class="delta-pos">
+              +95%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.limit</td>
+            <td>270Mi</td>
+            <td><strong>422Mi</strong></td>
+            <td class="delta-pos">
+              +56%
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <div>
+        <h3>HPA</h3>
+        <table>
+          <tr><th>Parâmetro</th><th>Recomendado</th></tr>
+          <tr><td>minReplicas</td><td><strong>3</strong></td></tr>
+          <tr><td>maxReplicas</td><td><strong>17</strong></td></tr>
+          <tr><td>CPU target</td><td><strong>70%</strong></td></tr>
+          <tr><td>Mem target</td><td><strong>75%</strong></td></tr>
+          <tr><td>scaleUp window</td><td>30s</td></tr>
+          <tr><td>scaleDown window</td><td>300s</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <!-- KEDA -->
+    
+
+    <!-- Comandos YAML -->
+    <details style="margin-top:16px">
+      <summary>Ver comandos de aplicação</summary>
+      <div class="yaml-cmd">
+        <span>kubectl</span> patch deployment api-gateway -n production \<br>
+        &nbsp;&nbsp;--patch-file <span>manifests/api-gateway-resources-patch.yaml</span><br><br>
+        <span>kubectl</span> apply -f <span>manifests/api-gateway-hpa.yaml</span>
+      </div>
+    </details>
+
+    <!-- Racional detalhado -->
+    <details style="margin-top:8px">
+      <summary>Ver racional dos cálculos</summary>
+      <div class="rationale" style="margin-top:8px">
+        <strong>Resources:</strong><br>
+        
+        &nbsp;&nbsp;cpu_request: P75(0.376 cores) * headroom 1.2x<br>
+        
+        &nbsp;&nbsp;cpu_limit: Request * burst_factor 1.5x (async); ajustado para knee point estimado 1.529 cores<br>
+        
+        &nbsp;&nbsp;mem_request: P75(216Mi) * headroom 1.3x<br>
+        
+        &nbsp;&nbsp;mem_limit: Request * 1.5x<br>
+        
+        <br>
+        <strong>HPA:</strong><br>
+        
+        &nbsp;&nbsp;min_replicas: Base: 3 (histórico P10); startup bump: +0 (startup P95=8s)<br>
+        
+        &nbsp;&nbsp;max_replicas: RPS pico projetado: 307/s / 18.7 RPS/pod = 17 réplicas<br>
+        
+        &nbsp;&nbsp;cpu_target: knee(1.529) / limit(1.529) * safety_margin(0.7) = 70% → clampado em 70%<br>
+        
+        &nbsp;&nbsp;mem_target: 75%<br>
+        
+      </div>
+    </details>
+  </div>
+  
+  <div class="card">
+    <div class="app-header">
+      <h2 style="margin:0">legacy-auth</h2>
+      <span class="badge badge-gray">
+        WSGI
+      </span>
+      <span class="badge badge-gray">Python 2.7</span>
+      <span class="badge badge-red">
+        CPU BOUND
+      </span>
+      
+      <span class="badge badge-red">⚠ 4 OOMKills</span>
+      
+      
+      <span class="badge badge-yellow">⚠ Throttle 24%</span>
+      
+    </div>
+
+    <!-- Stats rápidos -->
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-label">CPU P95</div>
+        <div class="stat-value">800m</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Mem P95</div>
+        <div class="stat-value">460Mi</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Réplicas avg/max</div>
+        <div class="stat-value">3.5 / 5</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Startup P95</div>
+        <div class="stat-value">16s</div>
+      </div>
+    </div>
+
+    <!-- Warnings -->
+    
+    <div class="warn-critical">
+      <div class="warn-label">critical — OOM_KILLS</div>
+      4 OOMKills detectados — memory limit muito baixo ou leak.
+    </div>
+    
+    <div class="warn-critical">
+      <div class="warn-label">critical — CPU_THROTTLE_HIGH</div>
+      CPU throttle P95 em 24% — limit de CPU muito baixo, latência impactada.
+    </div>
+    
+    <div class="warn-warning">
+      <div class="warn-label">warning — PYTHON_EOL</div>
+      Python 2.7 chegou ao EOL em Jan/2020. Planeje a migração para 3.x.
+    </div>
+    
+
+    <!-- Tabela comparativa -->
+    <div class="grid-2" style="margin-top:16px">
+      <div>
+        <h3>CPU & Memória — Resources</h3>
+        <table>
+          <tr>
+            <th>Parâmetro</th><th>Atual</th><th>Recomendado</th><th>Δ</th>
+          </tr>
+          <tr>
+            <td>cpu.request</td>
+            <td>350m</td>
+            <td><strong>961m</strong></td>
+            <td class="delta-pos">
+              +174%
+            </td>
+          </tr>
+          <tr>
+            <td>cpu.limit</td>
+            <td>750m</td>
+            <td><strong>1.9</strong></td>
+            <td class="delta-pos">
+              +156%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.request</td>
+            <td>256Mi</td>
+            <td><strong>500Mi</strong></td>
+            <td class="delta-pos">
+              +95%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.limit</td>
+            <td>480Mi</td>
+            <td><strong>1.1Gi</strong></td>
+            <td class="delta-pos">
+              +130%
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <div>
+        <h3>HPA</h3>
+        <table>
+          <tr><th>Parâmetro</th><th>Recomendado</th></tr>
+          <tr><td>minReplicas</td><td><strong>2</strong></td></tr>
+          <tr><td>maxReplicas</td><td><strong>11</strong></td></tr>
+          <tr><td>CPU target</td><td><strong>40%</strong></td></tr>
+          <tr><td>Mem target</td><td><strong>75%</strong></td></tr>
+          <tr><td>scaleUp window</td><td>30s</td></tr>
+          <tr><td>scaleDown window</td><td>300s</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <!-- KEDA -->
+    
+
+    <!-- Comandos YAML -->
+    <details style="margin-top:16px">
+      <summary>Ver comandos de aplicação</summary>
+      <div class="yaml-cmd">
+        <span>kubectl</span> patch deployment legacy-auth -n production \<br>
+        &nbsp;&nbsp;--patch-file <span>manifests/legacy-auth-resources-patch.yaml</span><br><br>
+        <span>kubectl</span> apply -f <span>manifests/legacy-auth-hpa.yaml</span>
+      </div>
+    </details>
+
+    <!-- Racional detalhado -->
+    <details style="margin-top:8px">
+      <summary>Ver racional dos cálculos</summary>
+      <div class="rationale" style="margin-top:8px">
+        <strong>Resources:</strong><br>
+        
+        &nbsp;&nbsp;cpu_request: P95(0.800 cores) usado por throttling detectado (24%); headroom 1.2x<br>
+        
+        &nbsp;&nbsp;cpu_limit: Request * burst_factor 2.0x (WSGI bloqueante)<br>
+        
+        &nbsp;&nbsp;mem_request: P75(385Mi) * headroom 1.3x<br>
+        
+        &nbsp;&nbsp;mem_limit: Request * 1.7x (Python 2.7: GC mais agressivo); +30% extra por 4 OOMKill(s) detectados<br>
+        
+        <br>
+        <strong>HPA:</strong><br>
+        
+        &nbsp;&nbsp;min_replicas: Base: 2 (histórico P10); startup bump: +0 (startup P95=16s)<br>
+        
+        &nbsp;&nbsp;max_replicas: RPS pico projetado: 381/s / 36.1 RPS/pod = 11 réplicas<br>
+        
+        &nbsp;&nbsp;cpu_target: knee(0.675) / limit(1.921) * safety_margin(0.7) = 25% → clampado em 40%<br>
+        
+        &nbsp;&nbsp;mem_target: 75%<br>
+        
+      </div>
+    </details>
+  </div>
+  
+  <div class="card">
+    <div class="app-header">
+      <h2 style="margin:0">data-processor</h2>
+      <span class="badge badge-gray">
+        WSGI
+      </span>
+      <span class="badge badge-gray">Python 3.9</span>
+      <span class="badge badge-red">
+        CPU BOUND
+      </span>
+      
+      
+    </div>
+
+    <!-- Stats rápidos -->
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-label">CPU P95</div>
+        <div class="stat-value">1286m</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Mem P95</div>
+        <div class="stat-value">735Mi</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Réplicas avg/max</div>
+        <div class="stat-value">4.5 / 6</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Startup P95</div>
+        <div class="stat-value">14s</div>
+      </div>
+    </div>
+
+    <!-- Warnings -->
+    
+
+    <!-- Tabela comparativa -->
+    <div class="grid-2" style="margin-top:16px">
+      <div>
+        <h3>CPU & Memória — Resources</h3>
+        <table>
+          <tr>
+            <th>Parâmetro</th><th>Atual</th><th>Recomendado</th><th>Δ</th>
+          </tr>
+          <tr>
+            <td>cpu.request</td>
+            <td>560m</td>
+            <td><strong>1.2</strong></td>
+            <td class="delta-pos">
+              +114%
+            </td>
+          </tr>
+          <tr>
+            <td>cpu.limit</td>
+            <td>1200m</td>
+            <td><strong>4.1</strong></td>
+            <td class="delta-pos">
+              +239%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.request</td>
+            <td>410Mi</td>
+            <td><strong>958Mi</strong></td>
+            <td class="delta-pos">
+              +134%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.limit</td>
+            <td>768Mi</td>
+            <td><strong>1.4Gi</strong></td>
+            <td class="delta-pos">
+              +87%
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <div>
+        <h3>HPA</h3>
+        <table>
+          <tr><th>Parâmetro</th><th>Recomendado</th></tr>
+          <tr><td>minReplicas</td><td><strong>2</strong></td></tr>
+          <tr><td>maxReplicas</td><td><strong>14</strong></td></tr>
+          <tr><td>CPU target</td><td><strong>70%</strong></td></tr>
+          <tr><td>Mem target</td><td><strong>75%</strong></td></tr>
+          <tr><td>scaleUp window</td><td>30s</td></tr>
+          <tr><td>scaleDown window</td><td>300s</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <!-- KEDA -->
+    
+
+    <!-- Comandos YAML -->
+    <details style="margin-top:16px">
+      <summary>Ver comandos de aplicação</summary>
+      <div class="yaml-cmd">
+        <span>kubectl</span> patch deployment data-processor -n production \<br>
+        &nbsp;&nbsp;--patch-file <span>manifests/data-processor-resources-patch.yaml</span><br><br>
+        <span>kubectl</span> apply -f <span>manifests/data-processor-hpa.yaml</span>
+      </div>
+    </details>
+
+    <!-- Racional detalhado -->
+    <details style="margin-top:8px">
+      <summary>Ver racional dos cálculos</summary>
+      <div class="rationale" style="margin-top:8px">
+        <strong>Resources:</strong><br>
+        
+        &nbsp;&nbsp;cpu_request: P75(0.999 cores) * headroom 1.2x<br>
+        
+        &nbsp;&nbsp;cpu_limit: Request * burst_factor 2.0x (WSGI bloqueante); ajustado para knee point estimado 4.073 cores<br>
+        
+        &nbsp;&nbsp;mem_request: P75(614Mi) * headroom 1.3x * lib_factor 1.2x (pandas/numpy detectado)<br>
+        
+        &nbsp;&nbsp;mem_limit: Request * 1.5x<br>
+        
+        <br>
+        <strong>HPA:</strong><br>
+        
+        &nbsp;&nbsp;min_replicas: Base: 2 (histórico P10); startup bump: +0 (startup P95=14s)<br>
+        
+        &nbsp;&nbsp;max_replicas: RPS pico projetado: 328/s / 24.1 RPS/pod = 14 réplicas<br>
+        
+        &nbsp;&nbsp;cpu_target: knee(4.073) / limit(4.073) * safety_margin(0.7) = 70% → clampado em 70%<br>
+        
+        &nbsp;&nbsp;mem_target: 75%<br>
+        
+      </div>
+    </details>
+  </div>
+  
+  <div class="card">
+    <div class="app-header">
+      <h2 style="margin:0">notification-svc</h2>
+      <span class="badge badge-blue">
+        ASYNC
+      </span>
+      <span class="badge badge-gray">Python 3.10</span>
+      <span class="badge badge-red">
+        CPU BOUND
+      </span>
+      
+      
+    </div>
+
+    <!-- Stats rápidos -->
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-label">CPU P95</div>
+        <div class="stat-value">241m</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Mem P95</div>
+        <div class="stat-value">184Mi</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Réplicas avg/max</div>
+        <div class="stat-value">2.5 / 4</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Startup P95</div>
+        <div class="stat-value">7s</div>
+      </div>
+    </div>
+
+    <!-- Warnings -->
+    
+
+    <!-- Tabela comparativa -->
+    <div class="grid-2" style="margin-top:16px">
+      <div>
+        <h3>CPU & Memória — Resources</h3>
+        <table>
+          <tr>
+            <th>Parâmetro</th><th>Atual</th><th>Recomendado</th><th>Δ</th>
+          </tr>
+          <tr>
+            <td>cpu.request</td>
+            <td>105m</td>
+            <td><strong>226m</strong></td>
+            <td class="delta-pos">
+              +116%
+            </td>
+          </tr>
+          <tr>
+            <td>cpu.limit</td>
+            <td>225m</td>
+            <td><strong>758m</strong></td>
+            <td class="delta-pos">
+              +237%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.request</td>
+            <td>102Mi</td>
+            <td><strong>200Mi</strong></td>
+            <td class="delta-pos">
+              +95%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.limit</td>
+            <td>192Mi</td>
+            <td><strong>300Mi</strong></td>
+            <td class="delta-pos">
+              +56%
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <div>
+        <h3>HPA</h3>
+        <table>
+          <tr><th>Parâmetro</th><th>Recomendado</th></tr>
+          <tr><td>minReplicas</td><td><strong>2</strong></td></tr>
+          <tr><td>maxReplicas</td><td><strong>8</strong></td></tr>
+          <tr><td>CPU target</td><td><strong>70%</strong></td></tr>
+          <tr><td>Mem target</td><td><strong>75%</strong></td></tr>
+          <tr><td>scaleUp window</td><td>30s</td></tr>
+          <tr><td>scaleDown window</td><td>300s</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <!-- KEDA -->
+    
+
+    <!-- Comandos YAML -->
+    <details style="margin-top:16px">
+      <summary>Ver comandos de aplicação</summary>
+      <div class="yaml-cmd">
+        <span>kubectl</span> patch deployment notification-svc -n production \<br>
+        &nbsp;&nbsp;--patch-file <span>manifests/notification-svc-resources-patch.yaml</span><br><br>
+        <span>kubectl</span> apply -f <span>manifests/notification-svc-hpa.yaml</span>
+      </div>
+    </details>
+
+    <!-- Racional detalhado -->
+    <details style="margin-top:8px">
+      <summary>Ver racional dos cálculos</summary>
+      <div class="rationale" style="margin-top:8px">
+        <strong>Resources:</strong><br>
+        
+        &nbsp;&nbsp;cpu_request: P75(0.189 cores) * headroom 1.2x<br>
+        
+        &nbsp;&nbsp;cpu_limit: Request * burst_factor 1.5x (async); ajustado para knee point estimado 0.758 cores<br>
+        
+        &nbsp;&nbsp;mem_request: P75(154Mi) * headroom 1.3x<br>
+        
+        &nbsp;&nbsp;mem_limit: Request * 1.5x<br>
+        
+        <br>
+        <strong>HPA:</strong><br>
+        
+        &nbsp;&nbsp;min_replicas: Base: 2 (histórico P10); startup bump: +0 (startup P95=7s)<br>
+        
+        &nbsp;&nbsp;max_replicas: RPS pico projetado: 543/s / 73.3 RPS/pod = 8 réplicas<br>
+        
+        &nbsp;&nbsp;cpu_target: knee(0.758) / limit(0.758) * safety_margin(0.7) = 70% → clampado em 70%<br>
+        
+        &nbsp;&nbsp;mem_target: 75%<br>
+        
+      </div>
+    </details>
+  </div>
+  
+  <div class="card">
+    <div class="app-header">
+      <h2 style="margin:0">billing-api</h2>
+      <span class="badge badge-gray">
+        WSGI
+      </span>
+      <span class="badge badge-gray">Python 3.8</span>
+      <span class="badge badge-red">
+        CPU BOUND
+      </span>
+      
+      
+      <span class="badge badge-yellow">⚠ Throttle 17%</span>
+      
+    </div>
+
+    <!-- Stats rápidos -->
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-label">CPU P95</div>
+        <div class="stat-value">640m</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Mem P95</div>
+        <div class="stat-value">368Mi</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Réplicas avg/max</div>
+        <div class="stat-value">3.5 / 5</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Startup P95</div>
+        <div class="stat-value">22s</div>
+      </div>
+    </div>
+
+    <!-- Warnings -->
+    
+    <div class="warn-warning">
+      <div class="warn-label">warning — CPU_THROTTLE_MODERATE</div>
+      CPU throttle P95 em 17% — considere aumentar o limit.
+    </div>
+    
+
+    <!-- Tabela comparativa -->
+    <div class="grid-2" style="margin-top:16px">
+      <div>
+        <h3>CPU & Memória — Resources</h3>
+        <table>
+          <tr>
+            <th>Parâmetro</th><th>Atual</th><th>Recomendado</th><th>Δ</th>
+          </tr>
+          <tr>
+            <td>cpu.request</td>
+            <td>280m</td>
+            <td><strong>768m</strong></td>
+            <td class="delta-pos">
+              +174%
+            </td>
+          </tr>
+          <tr>
+            <td>cpu.limit</td>
+            <td>600m</td>
+            <td><strong>1.5</strong></td>
+            <td class="delta-pos">
+              +156%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.request</td>
+            <td>205Mi</td>
+            <td><strong>400Mi</strong></td>
+            <td class="delta-pos">
+              +95%
+            </td>
+          </tr>
+          <tr>
+            <td>memory.limit</td>
+            <td>384Mi</td>
+            <td><strong>600Mi</strong></td>
+            <td class="delta-pos">
+              +56%
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <div>
+        <h3>HPA</h3>
+        <table>
+          <tr><th>Parâmetro</th><th>Recomendado</th></tr>
+          <tr><td>minReplicas</td><td><strong>2</strong></td></tr>
+          <tr><td>maxReplicas</td><td><strong>11</strong></td></tr>
+          <tr><td>CPU target</td><td><strong>40%</strong></td></tr>
+          <tr><td>Mem target</td><td><strong>75%</strong></td></tr>
+          <tr><td>scaleUp window</td><td>30s</td></tr>
+          <tr><td>scaleDown window</td><td>300s</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <!-- KEDA -->
+    
+
+    <!-- Comandos YAML -->
+    <details style="margin-top:16px">
+      <summary>Ver comandos de aplicação</summary>
+      <div class="yaml-cmd">
+        <span>kubectl</span> patch deployment billing-api -n production \<br>
+        &nbsp;&nbsp;--patch-file <span>manifests/billing-api-resources-patch.yaml</span><br><br>
+        <span>kubectl</span> apply -f <span>manifests/billing-api-hpa.yaml</span>
+      </div>
+    </details>
+
+    <!-- Racional detalhado -->
+    <details style="margin-top:8px">
+      <summary>Ver racional dos cálculos</summary>
+      <div class="rationale" style="margin-top:8px">
+        <strong>Resources:</strong><br>
+        
+        &nbsp;&nbsp;cpu_request: P95(0.640 cores) usado por throttling detectado (17%); headroom 1.2x<br>
+        
+        &nbsp;&nbsp;cpu_limit: Request * burst_factor 2.0x (WSGI bloqueante)<br>
+        
+        &nbsp;&nbsp;mem_request: P75(308Mi) * headroom 1.3x<br>
+        
+        &nbsp;&nbsp;mem_limit: Request * 1.5x<br>
+        
+        <br>
+        <strong>HPA:</strong><br>
+        
+        &nbsp;&nbsp;min_replicas: Base: 2 (histórico P10); startup bump: +0 (startup P95=22s)<br>
+        
+        &nbsp;&nbsp;max_replicas: RPS pico projetado: 379/s / 36.2 RPS/pod = 11 réplicas<br>
+        
+        &nbsp;&nbsp;cpu_target: knee(0.540) / limit(1.536) * safety_margin(0.7) = 25% → clampado em 40%<br>
+        
+        &nbsp;&nbsp;mem_target: 75%<br>
+        
+      </div>
+    </details>
+  </div>
+  
+</div>
+</body>
+</html>
