@@ -1,3 +1,24 @@
+#!/usr/bin/env python3
+"""
+main.py — k8s Resource Advisor CLI
+
+Fluxo principal (sem configuração de apps):
+  1. GitHub descobre todos os repos da org com deploy.yaml
+  2. Extrai do deploy.yaml: DD_SERVICE, namespace, resources, HPA atual
+  3. Extrai do Dockerfile: Python version
+  4. Extrai de pyproject.toml/requirements.txt: framework, dependências
+  5. Datadog coleta métricas reais das últimas N semanas por serviço
+  6. Calcula resources e HPA recomendados
+  7. Gera YAMLs comentados + relatório HTML
+
+Uso:
+  python main.py run --weeks 4 --output ./output
+  python main.py run --filter api --weeks 2        # só repos com "api" no nome
+  python main.py run --repo minha-org/minha-api    # repo específico
+  python main.py generate                          # regenera YAMLs do cache
+  python main.py list                              # lista apps descobertas sem rodar
+"""
+
 import dataclasses
 import json
 import os
@@ -30,7 +51,7 @@ except ImportError:
     Table = None
     Progress = None
 
-CONFIG_PATH = Path("config/settings.yaml")
+CONFIG_PATH = Path("src/config/settings.yaml")
 
 
 # ─────────────────────── Config ────────────────────────────────────────────
@@ -61,6 +82,10 @@ def apply_overrides(app_config: dict, config: dict) -> dict:
 # ─────────────────────── Discovery ─────────────────────────────────────────
 
 def discover_apps(config: dict, repo_filter: Optional[str] = None) -> list[dict]:
+    """
+    Descobre todos os apps da org via GitHub e converte em app_configs.
+    Retorna lista ordenada por nome, excluindo repos sem DD_SERVICE.
+    """
     from collectors.github import GitHubCollector, github_info_to_app_config
 
     gh_cfg = config.get("github", {})
@@ -110,6 +135,7 @@ def discover_apps(config: dict, repo_filter: Optional[str] = None) -> list[dict]
 
 
 def discover_single_repo(owner: str, repo: str, config: dict) -> dict:
+    """Descobre um único repositório por owner/repo."""
     from collectors.github import GitHubCollector, github_info_to_app_config
 
     gh_cfg = config.get("github", {})
@@ -230,8 +256,13 @@ def run_batch(
                     c = "red" if w.severity == "critical" else "yellow"
                     console.print(f"  [{c}]⚠ {w.code}[/{c}] {w.message}")
             results.append(result)
+        except InsufficientDataError as exc:
+            console.print(f"  [red]✗ Dados insuficientes:[/red]")
+            for line in str(exc).splitlines():
+                console.print(f"    [yellow]{line}[/yellow]")
+            failed.append(name)
         except Exception as exc:
-            console.print(f"  [red]✗ Erro: {exc}[/red]")
+            console.print(f"  [red]✗ Erro inesperado: {exc}[/red]")
             import traceback; traceback.print_exc()
             failed.append(name)
 

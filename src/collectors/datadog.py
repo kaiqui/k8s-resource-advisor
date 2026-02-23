@@ -12,6 +12,14 @@ Métricas coletadas:
   - HTTP requests por segundo (se instrumentado)
   - Pod startup duration (detects slow cold starts)
   - Réplicas ativas ao longo do tempo
+
+Comportamento quando não há dados:
+  - CPU e memória são métricas obrigatórias.
+  - Se ambas retornarem vazias, levanta InsufficientDataError — o pipeline
+    aborta essa app com mensagem clara em vez de gerar recomendações com
+    valores mínimos default que seriam inválidos.
+  - As demais métricas (RPS, réplicas, throttle) são opcionais: ausência
+    apenas reduz a qualidade das recomendações, com warning no relatório.
 """
 
 import json
@@ -40,6 +48,15 @@ except ImportError:
     console = _FallbackConsole()
 
 
+class InsufficientDataError(Exception):
+    """
+    Levantada quando os dados do Datadog são insuficientes para gerar
+    recomendações válidas. O pipeline deve abortar essa app e informar o usuário
+    em vez de prosseguir com valores default que seriam enganosos.
+    """
+    pass
+
+
 @dataclass
 class AppMetrics:
     """Resultado bruto da coleta para uma app."""
@@ -54,11 +71,11 @@ class AppMetrics:
     weeks_collected: int
 
     # Séries temporais (lista de valores float, amostras a cada interval_seconds)
-    cpu_usage_cores: list[float] = field(default_factory=list)       # cores em uso
-    cpu_throttle_ratio: list[float] = field(default_factory=list)    # 0.0 a 1.0
-    memory_bytes: list[float] = field(default_factory=list)          # bytes working set
-    rps: list[float] = field(default_factory=list)                   # req/s por pod
-    replica_count: list[float] = field(default_factory=list)         # replicas ativas
+    cpu_usage_cores: list[float] = field(default_factory=list)
+    cpu_throttle_ratio: list[float] = field(default_factory=list)
+    memory_bytes: list[float] = field(default_factory=list)
+    rps: list[float] = field(default_factory=list)
+    replica_count: list[float] = field(default_factory=list)
 
     # Métricas pontuais
     oom_kill_count: int = 0
@@ -80,51 +97,10 @@ class DatadogCollector:
     Coleta métricas do Datadog usando a API v1 de timeseries.
 
     As queries usam as métricas padrão do Kubernetes com o Datadog Agent:
-      kubernetes.cpu.usage.total   → nanosegundos, dividimos por 1e9 para cores
+      kubernetes.cpu.usage.total    → nanosegundos, dividimos por 1e9 para cores
       kubernetes.memory.working_set → bytes
       kubernetes.containers.restarts (com reason=OOMKilled)
-      container.uptime             → startup proxy
-
-    Para RPS, tenta métricas de trace (trace.web.request) e APM.
     """
-
-    # Queries Datadog por métrica
-    QUERIES = {
-        "cpu_usage": (
-            "avg:kubernetes.cpu.usage.total{{{filters}}} by {{pod_name}} / 1e9"
-        ),
-        "cpu_throttle": (
-            "avg:kubernetes.cpu.throttled.time{{{filters}}} by {{pod_name}} / "
-            "avg:kubernetes.cpu.usage.total{{{filters}}} by {{pod_name}}"
-        ),
-        "memory": (
-            "avg:kubernetes.memory.working_set{{{filters}}} by {{pod_name}}"
-        ),
-        "rps_apm": (
-            "sum:trace.web.request.hits{{{filters}},env:{env}}.as_rate()"
-        ),
-        "rps_nginx": (
-            "sum:nginx.net.request_per_s{{{filters}}}"
-        ),
-        "oom_kills": (
-            "sum:kubernetes.containers.restarts{{{filters}},reason:oomkilled}.as_count()"
-        ),
-        "replicas": (
-            "avg:kubernetes.deployments.replicas_available{{{filters}}}"
-        ),
-        "cpu_request": (
-            "avg:kubernetes.cpu.requests{{{filters}}} by {{pod_name}}"
-        ),
-        "mem_request": (
-            "avg:kubernetes.memory.requests{{{filters}}} by {{pod_name}}"
-        ),
-        "cpu_limit": (
-            "avg:kubernetes.cpu.limits{{{filters}}} by {{pod_name}}"
-        ),
-        "mem_limit": (
-            "avg:kubernetes.memory.limits{{{filters}}} by {{pod_name}}"
-        ),
-    }
 
     def __init__(self, api_key: str, app_key: str, site: str = "datadoghq.com"):
         if not HAS_DATADOG:
@@ -138,84 +114,111 @@ class DatadogCollector:
         config.server_variables["site"] = site
         self._config = config
 
-    def _build_filters(self, app_config: dict) -> str:
-        """Monta a string de filtros para as queries."""
-        service = app_config["dd_service"]
-        env = app_config.get("dd_env", "production")
-        namespace = app_config.get("namespace", "default")
-        filters = f"service:{service},env:{env},kube_namespace:{namespace}"
-        return filters
+    # ── Compatibilidade de API ────────────────────────────────────────────
 
     @staticmethod
     def _call_query_metrics(api, start: int, end: int, query: str):
         """
         Chama api.query_metrics() com a assinatura correta para a versão instalada.
 
-        O datadog-api-client renomeou os parâmetros ao longo das versões:
+        O datadog-api-client alterou a assinatura entre versões:
           < 2.x   → query_metrics(start=, end=, query=)
-          >= 2.x  → query_metrics(_from, to, query)  (posicionais)
+          >= 2.x  → argumentos posicionais (start, end, query)
 
-        Tenta cada variante em ordem; retorna na primeira que funcionar.
+        Tenta cada variante em ordem.
         """
-        # versão >= 2.x: posicionais
         try:
             return api.query_metrics(start, end, query)
         except TypeError:
             pass
-        # versão antiga: kwargs start/end
         try:
             return api.query_metrics(start=start, end=end, query=query)
         except TypeError:
             pass
-        # variante com _from/to
         return api.query_metrics(_from=start, to=end, query=query)
 
+    @staticmethod
+    def _point_value(point) -> Optional[float]:
+        """
+        Extrai o valor numérico de um ponto da série temporal.
+
+        O formato mudou entre versões do cliente:
+          Versão antiga: pointlist é lista de [timestamp, value]  → p[1]
+          Versão nova:   pointlist é lista de objetos Point       → p.value
+        """
+        # Tenta acesso por índice (formato lista [ts, value])
+        try:
+            v = point[1]
+            if v is not None:
+                return float(v)
+            return None
+        except (TypeError, KeyError, IndexError):
+            pass
+
+        # Tenta atributo .value (objeto Point)
+        try:
+            v = point.value
+            if v is not None:
+                return float(v)
+            return None
+        except AttributeError:
+            pass
+
+        # Tenta atributo .y (algumas versões usam x/y)
+        try:
+            v = point.y
+            if v is not None:
+                return float(v)
+            return None
+        except AttributeError:
+            pass
+
+        return None
+
+    # ── Queries ───────────────────────────────────────────────────────────
+
     def _query_metric(
-        self,
-        api,
-        query: str,
-        start: int,
-        end: int,
+        self, api, query: str, start: int, end: int
     ) -> list[float]:
-        """Executa uma query e retorna lista de valores (média de todas as series)."""
+        """Executa uma query e retorna lista plana de valores de todas as séries."""
         try:
             resp = self._call_query_metrics(api, start, end, query)
             all_values = []
             if resp.series:
                 for series in resp.series:
-                    vals = [p[1] for p in series.pointlist if p[1] is not None]
-                    all_values.extend(vals)
+                    for p in series.pointlist:
+                        v = self._point_value(p)
+                        if v is not None:
+                            all_values.append(v)
             return all_values
         except Exception as exc:
             console.print(f"    [yellow]⚠ Query falhou: {exc}[/yellow]")
             return []
 
     def _query_metric_avg_series(
-        self,
-        api,
-        query: str,
-        start: int,
-        end: int,
+        self, api, query: str, start: int, end: int
     ) -> list[float]:
         """
-        Retorna a série temporal média entre todos os pods.
-        Útil para CPU/memória onde queremos o comportamento médio por pod.
+        Retorna a série temporal com a média de todos os pods por timestamp.
+        Útil para CPU e memória onde queremos o comportamento médio por pod,
+        não a soma do cluster.
         """
         try:
             resp = self._call_query_metrics(api, start, end, query)
             if not resp.series:
                 return []
 
-            # Alinhar todas as series pelo mesmo índice de tempo
             all_series = []
             for series in resp.series:
-                vals = [p[1] if p[1] is not None else float("nan") for p in series.pointlist]
+                vals = []
+                for p in series.pointlist:
+                    v = self._point_value(p)
+                    vals.append(v if v is not None else float("nan"))
                 all_series.append(vals)
 
             if not all_series:
                 return []
 
-            # Média por timestamp (ignora NaN)
             max_len = max(len(s) for s in all_series)
             result = []
             for i in range(max_len):
@@ -227,6 +230,8 @@ class DatadogCollector:
             console.print(f"    [yellow]⚠ Query série falhou: {exc}[/yellow]")
             return []
 
+    # ── Coleta principal ──────────────────────────────────────────────────
+
     def collect(
         self,
         app_config: dict,
@@ -235,16 +240,11 @@ class DatadogCollector:
         cache_dir: Optional[str] = None,
     ) -> AppMetrics:
         """
-        Ponto de entrada principal. Coleta todas as métricas de uma app.
+        Coleta todas as métricas de uma app.
 
-        Args:
-            app_config: dicionário com campos do settings.yaml
-            weeks: janela de coleta em semanas
-            interval_seconds: granularidade das métricas
-            cache_dir: se fornecido, salva/carrega cache JSON
-
-        Returns:
-            AppMetrics preenchido
+        Levanta InsufficientDataError se CPU e memória retornarem vazias —
+        isso indica que as queries falharam ou a instrumentação está ausente,
+        e prosseguir geraria recomendações com valores mínimos inválidos.
         """
         app_name = app_config["name"]
 
@@ -259,13 +259,14 @@ class DatadogCollector:
 
         now = int(time.time())
         start = now - (weeks * 7 * 24 * 3600)
-        filters = self._build_filters(app_config)
         env = app_config.get("dd_env", "production")
+        svc = app_config["dd_service"]
+        ns = app_config.get("namespace", "default")
 
         metrics = AppMetrics(
             app_name=app_name,
-            namespace=app_config.get("namespace", "default"),
-            dd_service=app_config["dd_service"],
+            namespace=ns,
+            dd_service=svc,
             dd_env=env,
             framework=app_config.get("framework", "wsgi"),
             python_version=app_config.get("python_version", "3.x"),
@@ -279,83 +280,113 @@ class DatadogCollector:
 
         with ApiClient(self._config) as client:
             api = MetricsApi(client)
-
             console.print(f"  [bold]Coletando:[/bold] {app_name}")
 
-            # CPU usage (cores médio por pod)
+            # ── CPU usage ────────────────────────────────────────────────
             console.print("    CPU usage...")
-            cpu_query = f"avg:kubernetes.cpu.usage.total{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace}}} by {{pod_name}} / 1e9"
-            metrics.cpu_usage_cores = self._query_metric_avg_series(api, cpu_query, start, now)
+            metrics.cpu_usage_cores = self._query_metric_avg_series(
+                api,
+                f"avg:kubernetes.cpu.usage.total{{service:{svc},kube_namespace:{ns}}} by {{pod_name}} / 1e9",
+                start, now,
+            )
 
-            # CPU throttle
+            # ── CPU throttle ─────────────────────────────────────────────
             console.print("    CPU throttle...")
-            throttle_q = f"avg:kubernetes.cpu.throttled.time{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace}}} / (avg:kubernetes.cpu.usage.total{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace}}} + 1)"
-            metrics.cpu_throttle_ratio = self._query_metric(api, throttle_q, start, now)
+            metrics.cpu_throttle_ratio = self._query_metric(
+                api,
+                f"avg:kubernetes.cpu.throttled.time{{service:{svc},kube_namespace:{ns}}} / "
+                f"(avg:kubernetes.cpu.usage.total{{service:{svc},kube_namespace:{ns}}} + 1)",
+                start, now,
+            )
 
-            # Memória
+            # ── Memória ──────────────────────────────────────────────────
             console.print("    Memória...")
-            mem_query = f"avg:kubernetes.memory.working_set{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace}}} by {{pod_name}}"
-            metrics.memory_bytes = self._query_metric_avg_series(api, mem_query, start, now)
+            metrics.memory_bytes = self._query_metric_avg_series(
+                api,
+                f"avg:kubernetes.memory.working_set{{service:{svc},kube_namespace:{ns}}} by {{pod_name}}",
+                start, now,
+            )
 
-            # RPS — tenta APM primeiro, depois nginx
+            # ── Dados obrigatórios: CPU e memória ─────────────────────────
+            # Se ambas vieram vazias, algo está fundamentalmente errado:
+            # service tag errada, namespace errado, agent não instalado,
+            # ou a aplicação não tem dados no período solicitado.
+            # Continuar geraria recomendações com valores mínimos default
+            # (50m CPU, 64Mi memória) que não refletem nada real.
+            if not metrics.cpu_usage_cores and not metrics.memory_bytes:
+                raise InsufficientDataError(
+                    f"Nenhum dado de CPU ou memória retornado pelo Datadog para '{svc}' "
+                    f"(namespace={ns}, env={env}, janela={weeks} semanas).\n"
+                    f"  Verifique:\n"
+                    f"  • O DD_SERVICE '{svc}' corresponde exatamente à tag service: no Datadog?\n"
+                    f"  • O namespace '{ns}' está correto?\n"
+                    f"  • O Datadog Agent está instalado no cluster e coletando métricas kubernetes.*?\n"
+                    f"  • A aplicação existia nesse período? Tente --weeks 1 ou --weeks 2."
+                )
+
+            # ── RPS ───────────────────────────────────────────────────────
             console.print("    RPS (APM)...")
-            rps_query = f"sum:trace.web.request.hits{{service:{app_config['dd_service']},env:{env}}}.as_rate()"
-            rps_vals = self._query_metric(api, rps_query, start, now)
+            rps_vals = self._query_metric(
+                api,
+                f"sum:trace.web.request.hits{{service:{svc},env:{env}}}.as_rate()",
+                start, now,
+            )
             if not rps_vals:
                 console.print("    RPS (nginx fallback)...")
-                rps_query2 = f"sum:nginx.net.request_per_s{{service:{app_config['dd_service']}}}"
-                rps_vals = self._query_metric(api, rps_query2, start, now)
-            # Normalizar por réplicas (RPS por pod)
-            metrics.rps = rps_vals  # divisão por réplicas no analyzer
+                rps_vals = self._query_metric(
+                    api,
+                    f"sum:nginx.net.request_per_s{{service:{svc}}}",
+                    start, now,
+                )
+            metrics.rps = rps_vals
 
-            # OOMKills
+            # ── OOMKills ──────────────────────────────────────────────────
             console.print("    OOMKills...")
-            oom_query = f"sum:kubernetes.containers.restarts{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace},reason:oomkilled}}.as_count()"
-            oom_vals = self._query_metric(api, oom_query, start, now)
+            oom_vals = self._query_metric(
+                api,
+                f"sum:kubernetes.containers.restarts{{service:{svc},kube_namespace:{ns},reason:oomkilled}}.as_count()",
+                start, now,
+            )
             metrics.oom_kill_count = int(sum(oom_vals))
 
-            # Réplicas
+            # ── Réplicas ──────────────────────────────────────────────────
             console.print("    Réplicas...")
-            replica_query = f"avg:kubernetes.deployments.replicas_available{{kube_deployment:{app_name},kube_namespace:{metrics.namespace}}}"
-            metrics.replica_count = self._query_metric(api, replica_query, start, now)
+            metrics.replica_count = self._query_metric(
+                api,
+                f"avg:kubernetes.deployments.replicas_available{{kube_deployment:{app_name},kube_namespace:{ns}}}",
+                start, now,
+            )
 
-            # Resources atuais (média histórica)
+            # ── Resources atuais via Datadog (se deploy.yaml não forneceu) ─
             console.print("    Resources atuais...")
-            cpu_req_q = f"avg:kubernetes.cpu.requests{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace}}}"
-            cpu_req_vals = self._query_metric(api, cpu_req_q, start, now)
-            if cpu_req_vals:
-                metrics.current_cpu_request_cores = float(np.mean(cpu_req_vals))
+            for query, attr in [
+                (f"avg:kubernetes.cpu.requests{{service:{svc},kube_namespace:{ns}}}",  "current_cpu_request_cores"),
+                (f"avg:kubernetes.memory.requests{{service:{svc},kube_namespace:{ns}}}", "current_mem_request_bytes"),
+                (f"avg:kubernetes.cpu.limits{{service:{svc},kube_namespace:{ns}}}",     "current_cpu_limit_cores"),
+                (f"avg:kubernetes.memory.limits{{service:{svc},kube_namespace:{ns}}}",  "current_mem_limit_bytes"),
+            ]:
+                vals = self._query_metric(api, query, start, now)
+                if vals and getattr(metrics, attr) == 0.0:
+                    setattr(metrics, attr, float(np.mean(vals)))
 
-            mem_req_q = f"avg:kubernetes.memory.requests{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace}}}"
-            mem_req_vals = self._query_metric(api, mem_req_q, start, now)
-            if mem_req_vals:
-                metrics.current_mem_request_bytes = float(np.mean(mem_req_vals))
-
-            cpu_lim_q = f"avg:kubernetes.cpu.limits{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace}}}"
-            cpu_lim_vals = self._query_metric(api, cpu_lim_q, start, now)
-            if cpu_lim_vals:
-                metrics.current_cpu_limit_cores = float(np.mean(cpu_lim_vals))
-
-            mem_lim_q = f"avg:kubernetes.memory.limits{{service:{app_config['dd_service']},kube_namespace:{metrics.namespace}}}"
-            mem_lim_vals = self._query_metric(api, mem_lim_q, start, now)
-            if mem_lim_vals:
-                metrics.current_mem_limit_bytes = float(np.mean(mem_lim_vals))
-
-            # Startup time — usa container uptime proxy
-            # Se disponível via custom metric ou kube_pod start_time
+            # ── Startup time ──────────────────────────────────────────────
             console.print("    Startup time...")
-            startup_query = f"histogram_quantile(0.50, sum(rate(kubernetes_pod_start_duration_seconds_bucket{{service:{app_config['dd_service']}}}[5m])) by (le))"
-            startup_vals = self._query_metric(api, startup_query, start, now)
+            startup_vals = self._query_metric(
+                api,
+                f"histogram_quantile(0.50, sum(rate(kubernetes_pod_start_duration_seconds_bucket"
+                f"{{service:{svc}}}[5m])) by (le))",
+                start, now,
+            )
             if startup_vals:
                 metrics.startup_p50_seconds = float(np.percentile(startup_vals, 50))
                 metrics.startup_p95_seconds = float(np.percentile(startup_vals, 95))
             else:
-                # fallback: estimativa por framework
                 metrics.startup_p50_seconds, metrics.startup_p95_seconds = _estimate_startup(app_config)
 
-        # Salva cache
+        # Salva cache — só salva se passou da validação de dados
         if cache_dir:
             Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            cache_path = Path(cache_dir) / f"{app_name}-metrics.json"
             with open(cache_path, "w") as f:
                 json.dump(asdict(metrics), f, indent=2)
             console.print(f"  [green]✓ Cache salvo:[/green] {cache_path}")
@@ -364,27 +395,19 @@ class DatadogCollector:
 
 
 def _estimate_startup(app_config: dict) -> tuple[float, float]:
-    """
-    Estimativa de startup time quando não há métrica disponível.
-    Baseado em benchmarks típicos por framework.
-    """
+    """Estimativa de startup time quando não há métrica disponível."""
     framework = app_config.get("framework", "wsgi").lower()
     py_ver = app_config.get("python_version", "3.x")
-
     estimates = {
-        "fastapi": (3.0, 8.0),
-        "aiohttp": (2.0, 6.0),
-        "flask": (4.0, 12.0),
-        "django": (8.0, 20.0),
-        "wsgi": (5.0, 15.0),
-        "async": (3.0, 8.0),
+        "fastapi":  (3.0,  8.0),
+        "aiohttp":  (2.0,  6.0),
+        "flask":    (4.0, 12.0),
+        "django":   (8.0, 20.0),
+        "wsgi":     (5.0, 15.0),
+        "async":    (3.0,  8.0),
     }
-
     p50, p95 = estimates.get(framework, (5.0, 15.0))
-
-    # Python 2.7 é mais lento no import
     if py_ver.startswith("2."):
         p50 *= 1.5
         p95 *= 1.5
-
     return p50, p95
