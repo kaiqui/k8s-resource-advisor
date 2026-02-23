@@ -1,3 +1,19 @@
+"""
+collectors/datadog.py
+
+Coleta métricas do Datadog para uma app durante um período de tempo.
+Retorna tudo que os calculadores precisam: CPU, memória, RPS, startup time, OOMKills.
+
+Métricas coletadas:
+  - CPU usage por pod (rate de nanosegundos)
+  - CPU throttling (detecta limit muito baixo)
+  - Memória working set por pod
+  - OOMKill count (detecta limit de memória estourado)
+  - HTTP requests por segundo (se instrumentado)
+  - Pod startup duration (detects slow cold starts)
+  - Réplicas ativas ao longo do tempo
+"""
+
 import json
 import os
 import time
@@ -26,6 +42,7 @@ except ImportError:
 
 @dataclass
 class AppMetrics:
+    """Resultado bruto da coleta para uma app."""
     app_name: str
     namespace: str
     dd_service: str
@@ -59,6 +76,17 @@ class AppMetrics:
 
 
 class DatadogCollector:
+    """
+    Coleta métricas do Datadog usando a API v1 de timeseries.
+
+    As queries usam as métricas padrão do Kubernetes com o Datadog Agent:
+      kubernetes.cpu.usage.total   → nanosegundos, dividimos por 1e9 para cores
+      kubernetes.memory.working_set → bytes
+      kubernetes.containers.restarts (com reason=OOMKilled)
+      container.uptime             → startup proxy
+
+    Para RPS, tenta métricas de trace (trace.web.request) e APM.
+    """
 
     # Queries Datadog por métrica
     QUERIES = {
@@ -118,6 +146,30 @@ class DatadogCollector:
         filters = f"service:{service},env:{env},kube_namespace:{namespace}"
         return filters
 
+    @staticmethod
+    def _call_query_metrics(api, start: int, end: int, query: str):
+        """
+        Chama api.query_metrics() com a assinatura correta para a versão instalada.
+
+        O datadog-api-client renomeou os parâmetros ao longo das versões:
+          < 2.x   → query_metrics(start=, end=, query=)
+          >= 2.x  → query_metrics(_from, to, query)  (posicionais)
+
+        Tenta cada variante em ordem; retorna na primeira que funcionar.
+        """
+        # versão >= 2.x: posicionais
+        try:
+            return api.query_metrics(start, end, query)
+        except TypeError:
+            pass
+        # versão antiga: kwargs start/end
+        try:
+            return api.query_metrics(start=start, end=end, query=query)
+        except TypeError:
+            pass
+        # variante com _from/to
+        return api.query_metrics(_from=start, to=end, query=query)
+
     def _query_metric(
         self,
         api,
@@ -127,7 +179,7 @@ class DatadogCollector:
     ) -> list[float]:
         """Executa uma query e retorna lista de valores (média de todas as series)."""
         try:
-            resp = api.query_metrics(start=start, end=end, query=query)
+            resp = self._call_query_metrics(api, start, end, query)
             all_values = []
             if resp.series:
                 for series in resp.series:
@@ -145,8 +197,12 @@ class DatadogCollector:
         start: int,
         end: int,
     ) -> list[float]:
+        """
+        Retorna a série temporal média entre todos os pods.
+        Útil para CPU/memória onde queremos o comportamento médio por pod.
+        """
         try:
-            resp = api.query_metrics(start=start, end=end, query=query)
+            resp = self._call_query_metrics(api, start, end, query)
             if not resp.series:
                 return []
 
@@ -178,6 +234,18 @@ class DatadogCollector:
         interval_seconds: int = 300,
         cache_dir: Optional[str] = None,
     ) -> AppMetrics:
+        """
+        Ponto de entrada principal. Coleta todas as métricas de uma app.
+
+        Args:
+            app_config: dicionário com campos do settings.yaml
+            weeks: janela de coleta em semanas
+            interval_seconds: granularidade das métricas
+            cache_dir: se fornecido, salva/carrega cache JSON
+
+        Returns:
+            AppMetrics preenchido
+        """
         app_name = app_config["name"]
 
         # Verifica cache
@@ -296,6 +364,10 @@ class DatadogCollector:
 
 
 def _estimate_startup(app_config: dict) -> tuple[float, float]:
+    """
+    Estimativa de startup time quando não há métrica disponível.
+    Baseado em benchmarks típicos por framework.
+    """
     framework = app_config.get("framework", "wsgi").lower()
     py_ver = app_config.get("python_version", "3.x")
 

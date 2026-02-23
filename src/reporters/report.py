@@ -1,3 +1,14 @@
+"""
+reporters/report.py
+
+Gera relatório HTML com:
+  - Resumo executivo por app
+  - Tabela comparativa (atual vs recomendado)
+  - Gráficos de CPU e memória (distribuição e série temporal)
+  - Warnings e diagnósticos
+  - Links para os YAMLs gerados
+"""
+
 from __future__ import annotations
 
 import json
@@ -201,7 +212,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <details style="margin-top:16px">
       <summary>Ver comandos de aplicação</summary>
       <div class="yaml-cmd">
-        <span>kubectl</span> patch deployment {{ item.app.app_name }} -n {{ item.app.namespace }} \<br>
+        <span>kubectl</span> patch deployment {{ item.app.app_name }} -n {{ item.app.namespace }} \\<br>
         &nbsp;&nbsp;--patch-file <span>manifests/{{ item.app.app_name }}-resources-patch.yaml</span><br><br>
         <span>kubectl</span> apply -f <span>manifests/{{ item.app.app_name }}-hpa.yaml</span>
       </div>
