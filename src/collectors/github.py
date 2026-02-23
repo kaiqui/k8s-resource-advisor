@@ -551,28 +551,28 @@ class GitHubCollector:
                 self._extract_hpa(doc, info)
 
     def _extract_deployment(self, doc: dict, info: GitHubAppInfo) -> None:
-        meta = doc.get("metadata", {})
+        meta = doc.get("metadata") or {}
         info.k8s_namespace = meta.get("namespace") or info.k8s_namespace
         info.k8s_deployment_name = meta.get("name")
 
-        spec = doc.get("spec", {})
+        spec = doc.get("spec") or {}
         if spec.get("replicas") is not None:
             info.k8s_replicas = int(spec["replicas"])
 
-        pod_template = spec.get("template", {})
-        pod_meta = pod_template.get("metadata", {})
-        pod_labels = pod_meta.get("labels", {})
-        pod_annotations = pod_meta.get("annotations", {})
-        containers = pod_template.get("spec", {}).get("containers", [])
+        pod_template = spec.get("template") or {}
+        pod_meta = pod_template.get("metadata") or {}
+        pod_labels = pod_meta.get("labels") or {}
+        pod_annotations = pod_meta.get("annotations") or {}
+        containers = (pod_template.get("spec") or {}).get("containers") or []
         if not containers:
             return
 
         container = containers[0]
 
         # Resources
-        resources = container.get("resources", {})
-        reqs = resources.get("requests", {})
-        lims = resources.get("limits", {})
+        resources = container.get("resources") or {}
+        reqs = resources.get("requests") or {}
+        lims = resources.get("limits") or {}
         if reqs.get("cpu"):    info.cpu_request = str(reqs["cpu"])
         if reqs.get("memory"): info.mem_request = str(reqs["memory"])
         if lims.get("cpu"):    info.cpu_limit = str(lims["cpu"])
@@ -580,12 +580,12 @@ class GitHubCollector:
 
         # DD tags — prioridade 1: env vars diretas ou via fieldRef
         env_vars = {}
-        for env_entry in container.get("env", []):
+        for env_entry in container.get("env") or []:
             name = env_entry.get("name", "")
             if env_entry.get("value"):
                 env_vars[name] = str(env_entry["value"])
-            elif env_entry.get("valueFrom", {}).get("fieldRef"):
-                field_path = env_entry["valueFrom"]["fieldRef"].get("fieldPath", "")
+            elif (env_entry.get("valueFrom") or {}).get("fieldRef"):
+                field_path = (env_entry["valueFrom"]["fieldRef"] or {}).get("fieldPath", "")
                 lm = re.search(r"labels\['([^']+)'\]", field_path)
                 if lm and lm.group(1) in pod_labels:
                     env_vars[name] = str(pod_labels[lm.group(1)])
@@ -624,7 +624,7 @@ class GitHubCollector:
             )
 
     def _extract_hpa(self, doc: dict, info: GitHubAppInfo) -> None:
-        spec = doc.get("spec", {})
+        spec = doc.get("spec") or {}
         if spec.get("minReplicas") is not None:
             info.hpa_min_replicas = int(spec["minReplicas"])
         if spec.get("maxReplicas") is not None:
@@ -636,11 +636,11 @@ class GitHubCollector:
             return
 
         # HPA v2
-        for metric in spec.get("metrics", []):
+        for metric in spec.get("metrics") or []:
             if metric.get("type") != "Resource":
                 continue
-            resource = metric.get("resource", {})
-            avg = resource.get("target", {}).get("averageUtilization")
+            resource = metric.get("resource") or {}
+            avg = (resource.get("target") or {}).get("averageUtilization")
             if avg is None:
                 continue
             if resource.get("name") == "cpu":    info.hpa_cpu_target = int(avg)
